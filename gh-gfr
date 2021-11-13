@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+set -e
+
+usage() {
+  echo "Usage: gh gfr [-r <reviewers>] <version>" >&2
+  echo "    reviewers: List of GitHub user ID (<uid>[,<uid>...])" >&2
+  echo "    version: <newversion>|major|minor|patch|premajor|preminor|prepatch|prerelease" >&2
+  exit 1
+}
+
+checkPrerequisites() {
+  for cmd in gh git git-flow npx; do
+    if ! command -v $cmd > /dev/null 2>&1; then
+      echo "$cmd is not installed. Please install it first." >&2
+      exit 1
+    fi
+  done
+
+  if ! git flow version | grep -q AVH > /dev/null 2>&1; then
+    echo "Installed git-flow is not AVH version. Please install it first." >&2
+    exit 1
+  fi
+  if ! git flow config > /dev/null 2>&1; then
+    echo "Current directory is not a git repo or a gitflow-enabled repo." >&2
+    exit 1
+  fi
+}
+
+cecho () {
+  echo -e "\033[33m$*\033[m"
+}
+
+getVersion() {
+  local file=$1
+  case $file in
+    package.json)
+      npm run env | grep npm_package_version | cut -d '=' -f 2
+      ;;
+    build.sbt)
+      grep 'version\s*:=' "$file" | cut -d'"' -f2
+      ;;
+  esac
+}
+
+updateVersion() {
+  local file=$1
+  local version=$2
+  case $file in
+    package.json)
+      npm --no-git-tag-version version "$version" > /dev/null
+      ;;
+    build.sbt)
+      sed -i "s/version\s*:=.*/version := \"$version\"/g" "$file"
+      ;;
+  esac
+}
+
+while getopts hr: OPT
+do
+  case $OPT in
+    h) usage ;;
+    r) REVIEWERS=$OPTARG ;;
+    *) usage ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+if [ $# -eq 0 ]; then
+  echo "VERSION required." >&2
+  usage
+fi
+
+checkPrerequisites
+
+VERSION=$1
+SELF=$(gh api user --jq .login)
+
+for VERFILE in package.json build.sbt ""; do
+  [ -f $VERFILE ] && break
+done
+case $VERSION in
+  major|minor|patch|premajor|preminor|prepatch|prerelease)
+    if [ -z $VERFILE ]; then
+      echo "package.json or build.sbt not found." >&2
+      exit 1
+    fi
+    # generate new version
+    VERSION=$(npx semver -i "$VERSION" "$(getVersion $VERFILE)")
+    ;;
+esac
+
+cecho "New version is $VERSION"
+read -r -p 'Are you sure to create new version? (y/N): ' yn
+if [[ $yn != [yY] ]]; then
+  exit 1
+fi
+
+BRANCH_MASTER=$(git config --local --get gitflow.branch.master)
+BRANCH_DEVELOP=$(git config --local --get gitflow.branch.develop)
+BRANCH_RELEASE=$(git config --local --get gitflow.prefix.release)$VERSION
+
+cecho "Start release branch"
+git flow release start "$VERSION"
+
+if [ -n "$VERFILE" ]; then
+  cecho "Upadte package version"
+  updateVersion $VERFILE "$VERSION"
+  git add -u
+  git commit -m "build: bump version to $VERSION"
+fi
+
+cecho "Finish release branch"
+GIT_MERGE_AUTOEDIT=no git flow release finish -k -m "$VERSION" "$VERSION"
+
+cecho "Push release branch to origin"
+git push -u origin "$BRANCH_RELEASE"
+
+cecho "Create PR for $BRANCH_RELEASE -> $BRANCH_MASTER"
+gh pr create -B "$BRANCH_MASTER" -H "$BRANCH_RELEASE" \
+  -a @me -r "${REVIEWERS:-$SELF}" \
+  -t "$VERSION release: $BRANCH_RELEASE to $BRANCH_MASTER" \
+  -b "Auto-generated pull request for release workflow"
+read -r -p 'Hit enter key after PR is approved...'
+
+cecho "Push branch $BRANCH_MASTER and tag $VERSION to origin"
+git push --atomic origin "$BRANCH_MASTER" "$VERSION"
+
+cecho "Create PR for $BRANCH_MASTER -> $BRANCH_DEVELOP"
+gh pr create -B "$BRANCH_DEVELOP" -H "$BRANCH_MASTER" \
+  -a @me -r "${REVIEWERS:-$SELF}" \
+  -t "$VERSION release: $BRANCH_MASTER to $BRANCH_DEVELOP" \
+  -b "Auto-generated pull request for release workflow"
+read -r -p 'Hit enter key after PR is approved...'
+
+cecho "Push branch $BRANCH_DEVELOP to origin"
+git push origin "$BRANCH_DEVELOP"
+
+cecho "Cleanup release branch"
+git branch -d "$BRANCH_RELEASE"
+git push -d origin "$BRANCH_RELEASE"
+
+cecho "Finished"
