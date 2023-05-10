@@ -50,7 +50,7 @@ updateVersion() {
       npm --no-git-tag-version version "$version" > /dev/null
       ;;
     build.sbt)
-      sed -i "s/version\s*:=.*/version := \"$version\"/g" "$file"
+      sed "s/version :=.*/version := \"$version\"/g" "$file" > $file.tmp && mv $file.tmp $file
       ;;
   esac
 }
